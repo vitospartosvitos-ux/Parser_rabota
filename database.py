@@ -1,7 +1,8 @@
 import os
 import psycopg2
+from psycopg2.extras import RealDictCursor
 
-# Render сам выдаст эту переменную, когда ты привяжешь базу данных
+# Ссылка на твою базу данных в облаке Render
 DATABASE_URL = os.getenv("DATABASE_URL")
 
 def get_connection():
@@ -10,89 +11,101 @@ def get_connection():
 def init_db():
     conn = get_connection()
     cursor = conn.cursor()
-
-    # Таблица постов (в PostgreSQL используем SERIAL вместо AUTOINCREMENT)
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS posts (
-        id SERIAL PRIMARY KEY,
-        post_id TEXT UNIQUE,
-        post_type TEXT,
-        channel TEXT,
-        text TEXT,
-        url TEXT,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    )
-    """)
-
-    # Таблица каналов
-    cursor.execute("""
-    CREATE TABLE IF NOT EXISTS channels (
-        id SERIAL PRIMARY KEY,
-        username TEXT UNIQUE
-    )
-    """)
-
-    # Автозаполнение базовыми каналами при первом старте
-    cursor.execute("SELECT COUNT(*) FROM channels")
-    if cursor.fetchone()[0] == 0:
-        default_channels = ["poisk_masterov", "rabota_sbor_mebel"]
-        for ch in default_channels:
-            cursor.execute("INSERT INTO channels (username) VALUES (%s) ON CONFLICT (username) DO NOTHING", (ch,))
-            
+    
+    # Таблица для постов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS posts (
+            id SERIAL PRIMARY KEY,
+            post_id TEXT UNIQUE,
+            post_type TEXT,
+            channel TEXT,
+            text TEXT,
+            url TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+    
+    # Таблица для каналов
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS channels (
+            id SERIAL PRIMARY KEY,
+            username TEXT UNIQUE
+        )
+    ''')
+    
     conn.commit()
     cursor.close()
     conn.close()
 
+def get_channels():
+    conn = get_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT username FROM channels")
+    rows = cursor.fetchall()
+    cursor.close()
+    conn.close()
+    return [row[0] for row in rows]
+
+def add_channel(username):
+    # Умная очистка: если ты случайно вставишь ссылку, бот сам вырежет только имя канала
+    username = username.replace('https://t.me/', '').replace('t.me/', '').replace('@', '').strip()
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        cursor.execute("INSERT INTO channels (username) VALUES (%s) ON CONFLICT (username) DO NOTHING", (username,))
+        conn.commit()
+    except Exception as e:
+        print(f"[!] Ошибка добавления канала: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
+def delete_channel(username):
+    conn = get_connection()
+    cursor = conn.cursor()
+    try:
+        # Железобетонное удаление канала по его имени
+        cursor.execute("DELETE FROM channels WHERE username = %s", (username,))
+        conn.commit()
+    except Exception as e:
+        print(f"[!] Ошибка удаления канала: {e}")
+    finally:
+        cursor.close()
+        conn.close()
+
 def post_exists(post_id):
     conn = get_connection()
     cursor = conn.cursor()
-    cursor.execute("SELECT id FROM posts WHERE post_id = %s", (post_id,))
-    result = cursor.fetchone()
+    cursor.execute("SELECT 1 FROM posts WHERE post_id = %s", (post_id,))
+    exists = cursor.fetchone() is not None
     cursor.close()
     conn.close()
-    return result is not None
+    return exists
 
 def save_post(post_id, post_type, channel, text, url):
     conn = get_connection()
     cursor = conn.cursor()
     try:
-        cursor.execute("""
-        INSERT INTO posts (post_id, post_type, channel, text, url)
-        VALUES (%s, %s, %s, %s, %s)
-        ON CONFLICT (post_id) DO NOTHING
-        """, (post_id, post_type, channel, text, url))
+        cursor.execute('''
+            INSERT INTO posts (post_id, post_type, channel, text, url)
+            VALUES (%s, %s, %s, %s, %s)
+            ON CONFLICT (post_id) DO NOTHING
+        ''', (post_id, post_type, channel, text, url))
         conn.commit()
     except Exception as e:
-        print(f"[!] Ошибка сохранения поста в Postgres: {e}", flush=True)
+        print(f"[!] Ошибка сохранения поста: {e}")
     finally:
         cursor.close()
         conn.close()
 
-def get_posts(post_type=None):
+def get_posts(limit=50):
     conn = get_connection()
-    cursor = conn.cursor()
-    
-    if post_type:
-        cursor.execute("SELECT post_id, post_type, channel, text, url FROM posts WHERE post_type = %s ORDER BY id DESC LIMIT 500", (post_type,))
-    else:
-        cursor.execute("SELECT post_id, post_type, channel, text, url FROM posts ORDER BY id DESC LIMIT 500")
-    
+    cursor = conn.cursor(cursor_factory=RealDictCursor)
+    cursor.execute("SELECT post_type, channel, text, url FROM posts ORDER BY id DESC LIMIT %s", (limit,))
     rows = cursor.fetchall()
-    
-    # Формируем список словарей, чтобы main.py читал поля по именам
-    posts = []
-    for row in rows:
-        posts.append({
-            "post_id": row[0],
-            "post_type": row[1],
-            "channel": row[2],
-            "text": row[3],
-            "url": row[4]
-        })
-        
     cursor.close()
     conn.close()
-    return posts
+    return rows
 
 def get_stats():
     conn = get_connection()
@@ -101,48 +114,12 @@ def get_stats():
     cursor.execute("SELECT COUNT(*) FROM posts")
     total = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE post_type='ORDER'")
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE post_type = 'ORDER'")
     orders = cursor.fetchone()[0]
     
-    cursor.execute("SELECT COUNT(*) FROM posts WHERE post_type='VACANCY'")
+    cursor.execute("SELECT COUNT(*) FROM posts WHERE post_type = 'VACANCY'")
     vacancies = cursor.fetchone()[0]
     
     cursor.close()
     conn.close()
     return {"total": total, "orders": orders, "vacancies": vacancies}
-
-def get_channels():
-    conn = get_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT username FROM channels ORDER BY id DESC")
-    channels = [row[0] for row in cursor.fetchall()]
-    cursor.close()
-    conn.close()
-    return channels
-
-def add_channel(username):
-    username = username.strip().replace("@", "").replace("https://t.me/s/", "").replace("https://t.me/", "")
-    if not username:
-        return False
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("INSERT INTO channels (username) VALUES (%s) ON CONFLICT (username) DO NOTHING", (username,))
-        conn.commit()
-        return True
-    except:
-        return False
-    finally:
-        cursor.close()
-        conn.close()
-        def delete_channel(username):
-    conn = get_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute("DELETE FROM channels WHERE username = %s", (username,))
-        conn.commit()
-    except Exception as e:
-        print(f"[!] Ошибка удаления канала: {e}")
-    finally:
-        cursor.close()
-        conn.close()
