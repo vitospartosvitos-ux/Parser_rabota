@@ -1,119 +1,274 @@
 import os
 import time
 import requests
+
 from bs4 import BeautifulSoup
 from threading import Thread
+
 from flask import Flask
 
-app = Flask(__name__)
+from database import (
+    init_db,
+    save_post,
+    post_exists,
+    get_posts,
+    get_stats
+)
 
-@app.route('/')
-def home():
-    return "Парсер мебели активен и работает 24/7", 200
+app = Flask(__name__)
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
-# Ключевые слова для фильтрации заказов
-KEYWORDS = ["сборка", "собрать", "мебель", "шкаф", "кухня", "кровать", "монтаж", "тумба", "стол", "комод", "мастер"]
-CHECK_INTERVAL = 600  # Проверка каждые 10 минут
+CHECK_INTERVAL = 600
 
-# Базовые каналы для теста (они живые, там прямо сейчас есть посты)
 CHANNELS_TO_PARSE = [
-    "poisk_masterov", 
+    "poisk_masterov",
     "rabota_sbor_mebel"
 ]
 
-history = set()
+ORDER_WORDS = [
+    "сборка",
+    "собрать",
+    "шкаф",
+    "кухня",
+    "комод",
+    "кровать",
+    "стол",
+    "тумба",
+    "монтаж мебели",
+    "сборка мебели"
+]
+
+VACANCY_WORDS = [
+    "требуется сборщик",
+    "ищем сборщика",
+    "вакансия",
+    "работа сборщик мебели",
+    "монтажник мебели"
+]
+
+
+@app.route("/")
+def home():
+
+    stats = get_stats()
+
+    return f"""
+    <h1>Furniture CRM</h1>
+
+    <p>Всего записей: {stats['total']}</p>
+    <p>Заказов: {stats['orders']}</p>
+    <p>Вакансий: {stats['vacancies']}</p>
+
+    <hr>
+
+    <a href='/orders'>Заказы</a><br>
+    <a href='/vacancies'>Вакансии</a>
+    """
+
+
+@app.route("/orders")
+def orders():
+
+    posts = get_posts("ORDER")
+
+    html = "<h1>Заказы</h1>"
+
+    for post in posts:
+
+        html += f"""
+        <div style='margin-bottom:20px'>
+        <a href='{post['url']}' target='_blank'>Открыть</a><br>
+        <b>{post['channel']}</b><br>
+        {post['text'][:500]}
+        </div>
+        <hr>
+        """
+
+    return html
+
+
+@app.route("/vacancies")
+def vacancies():
+
+    posts = get_posts("VACANCY")
+
+    html = "<h1>Вакансии</h1>"
+
+    for post in posts:
+
+        html += f"""
+        <div style='margin-bottom:20px'>
+        <a href='{post['url']}' target='_blank'>Открыть</a><br>
+        <b>{post['channel']}</b><br>
+        {post['text'][:500]}
+        </div>
+        <hr>
+        """
+
+    return html
+
 
 def send_telegram_notification(text):
+
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": TELEGRAM_CHAT_ID, 
-        "text": text, 
-        "parse_mode": "HTML",
-        "disable_web_page_preview": False
-    }
+
     try:
-        res = requests.post(url, json=payload, timeout=10)
-        return res.status_code == 200
+
+        requests.post(
+            url,
+            json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML"
+            },
+            timeout=15
+        )
+
     except Exception as e:
-        print(f"[!] Ошибка отправки в Telegram: {e}", flush=True)
-        return False
+        print(e)
+
+
+def detect_type(text):
+
+    lower = text.lower()
+
+    if any(x in lower for x in VACANCY_WORDS):
+        return "VACANCY"
+
+    if any(x in lower for x in ORDER_WORDS):
+        return "ORDER"
+
+    return None
+
 
 def parse_channels():
-    print(f"\n[*] Начинаю круг сканирования: {time.strftime('%H:%M:%S')}", flush=True)
-    
+
+    print("SCAN START")
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0"
     }
 
     for channel in CHANNELS_TO_PARSE:
-        url = f"https://t.me/s/{channel}"
+
         try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code != 200:
-                print(f"[!] Ошибка доступа к каналу @{channel} (Код: {response.status_code})", flush=True)
-                continue
-            
-            soup = BeautifulSoup(response.text, "html.parser")
-            messages = soup.find_all("div", class_="tgme_widget_message")
-            new_posts_count = 0
-            
+
+            url = f"https://t.me/s/{channel}"
+
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=20
+            )
+
+            soup = BeautifulSoup(
+                response.text,
+                "html.parser"
+            )
+
+            messages = soup.find_all(
+                "div",
+                class_="tgme_widget_message"
+            )
+
             for msg in messages:
+
                 post_id = msg.get("data-post")
-                if not post_id or post_id in history:
+
+                if not post_id:
                     continue
-                
-                text_block = msg.find("div", class_="tgme_widget_message_text")
+
+                if post_exists(post_id):
+                    continue
+
+                text_block = msg.find(
+                    "div",
+                    class_="tgme_widget_message_text"
+                )
+
                 if not text_block:
                     continue
-                
-                text = text_block.get_text(separator="\n").strip()
-                
-                # Ищем совпадения. Теперь бот шлет ВСЁ, что найдет прямо сейчас в истории
-                if any(keyword in text.lower() for keyword in KEYWORDS):
-                    link_anchor = msg.find("a", class_="tgme_widget_message_date")
-                    post_url = link_anchor.get("href") if link_anchor else f"https://t.me/{post_id}"
-                    
-                    history.add(post_id)
-                    
-                    alert_text = (
-                        f"<b>🔥 НАЙДЕН ЗАКАЗ!</b>\n\n"
-                        f"<b>📍 Источник:</b> @{channel}\n"
-                        f"<b>🔗 Ссылка на пост:</b> <a href='{post_url}'>Открыть в TG</a>\n\n"
-                        f"<b>📋 Текст объявления:</b>\n<i>{text[:2500]}</i>"
-                    )
-                    send_telegram_notification(alert_text)
-                    new_posts_count += 1
-                    time.sleep(1)  # Анти-спам лимит Telegram
-                        
-            if new_posts_count > 0:
-                print(f"[+] Найдено и отправлено {new_posts_count} заказов из @{channel}", flush=True)
-            else:
-                print(f"[-] В канале @{channel} совпадений по ключевым словам пока нет.", flush=True)
-                
-            time.sleep(2)
-        except Exception as e:
-            print(f"[!] Критическая ошибка при обработке @{channel}: {e}", flush=True)
 
-def run_parser_loop():
-    time.sleep(3)
+                text = text_block.get_text(
+                    separator="\n"
+                ).strip()
+
+                post_type = detect_type(text)
+
+                if not post_type:
+                    continue
+
+                link = msg.find(
+                    "a",
+                    class_="tgme_widget_message_date"
+                )
+
+                post_url = (
+                    link.get("href")
+                    if link
+                    else f"https://t.me/{post_id}"
+                )
+
+                save_post(
+                    post_id,
+                    post_type,
+                    channel,
+                    text,
+                    post_url
+                )
+
+                icon = "🔥"
+
+                if post_type == "VACANCY":
+                    icon = "💼"
+
+                send_telegram_notification(
+                    f"{icon} {post_type}\n\n{text[:3000]}"
+                )
+
+                print("saved", post_id)
+
+                time.sleep(1)
+
+        except Exception as e:
+
+            print(
+                f"error {channel}: {e}"
+            )
+
+
+def parser_loop():
+
+    time.sleep(5)
+
     while True:
+
         try:
             parse_channels()
         except Exception as e:
-            print(f"[CRITICAL] Сбой в основном цикле: {e}", flush=True)
+            print(e)
+
         time.sleep(CHECK_INTERVAL)
 
-if __name__ == "__main__":
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
-        print("[CRITICAL] Переменные окружения не настроены!", flush=True)
-        exit(1)
 
-    parser_thread = Thread(target=run_parser_loop)
+if __name__ == "__main__":
+
+    init_db()
+
+    parser_thread = Thread(
+        target=parser_loop
+    )
+
     parser_thread.daemon = True
     parser_thread.start()
-    
-    port = int(os.getenv("PORT", 10000))
-    app.run(host="0.0.0.0", port=port)
+
+    port = int(
+        os.getenv("PORT", 10000)
+    )
+
+    app.run(
+        host="0.0.0.0",
+        port=port
+    )
