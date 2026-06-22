@@ -4,47 +4,49 @@ import time
 from bs4 import BeautifulSoup
 from database import save_post, post_exists
 
-# Авито требует, чтобы запрос выглядел как от реального браузера
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7",
-    "Referer": "https://www.avito.ru/"
+    "Referer": "https://www.google.com/"
 }
 
 def parse_avito(query_url):
-    """
-    query_url: полная ссылка на результаты поиска на Авито
-    """
-    print(f"[*] Запуск парсинга Авито: {query_url}")
-    
+    print(f"[*] Запуск диагностики Авито...")
     try:
-        # Добавляем рандомную задержку, чтобы Авито не понял, что мы бот
-        time.sleep(random.uniform(2, 5))
+        time.sleep(random.uniform(5, 10))
+        response = requests.get(query_url, headers=HEADERS, timeout=20)
         
-        response = requests.get(query_url, headers=HEADERS, timeout=15)
+        # Логируем результат для отладки
+        print(f"[*] Ответ Авито: код {response.status_code}, длина контента {len(response.text)}")
+        
         if response.status_code != 200:
-            print(f"[!] Авито ответил кодом {response.status_code}")
+            print(f"[!] Авито блокирует или ошибка: {response.status_code}")
             return
 
         soup = BeautifulSoup(response.text, "html.parser")
         
-        # На Авито карточки объявлений лежат в определенных классах
-        # ВАЖНО: Классы Авито часто меняет, если перестанет парсить — нужно обновлять селектор
-        items = soup.find_all("div", {"data-marker": "item"})
+        # Пробуем разные селекторы, если Авито сменил верстку
+        items = soup.select('div[data-marker="item"]')
+        print(f"[*] Найдено элементов через data-marker: {len(items)}")
         
+        if len(items) == 0:
+            # Если не нашли, выведем в логи кусок кода, чтобы я увидел, что там сейчас
+            print("[!] Элементы не найдены! Скинь мне эту ошибку, я обновлю селектор.")
+            return
+
         for item in items:
-            title_tag = item.find("h3", {"itemprop": "name"})
-            link_tag = item.find("a", {"itemprop": "url"})
+            title_tag = item.select_one('h3[itemprop="name"]')
+            link_tag = item.select_one('a[itemprop="url"]')
             
             if title_tag and link_tag:
                 title = title_tag.text.strip()
                 link = "https://www.avito.ru" + link_tag["href"]
-                post_id = link.split("_")[-1] # Уникальный ID объявления из ссылки
+                post_id = link.split("_")[-1]
                 
                 if not post_exists(post_id):
-                    # Сохраняем как ORDER (заказ)
                     save_post(post_id, "ORDER", "avito", title, link)
-                    print(f"[+] Найден заказ на Авито: {title}")
+                    print(f"[+] УСПЕХ! Найден лид: {title}")
                     
     except Exception as e:
-        print(f"[!] Ошибка при парсинге Авито: {e}")
+        print(f"[!] Ошибка парсинга Авито: {e}")
